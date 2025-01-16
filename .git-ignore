@@ -1,0 +1,6 @@
+pool/
+keys/*
+.terraform/
+.direnv/
+.terraform.lock.hcl
+terraform.tfstate*

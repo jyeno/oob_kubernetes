@@ -1,0 +1,207 @@
+---
+- name: Install Docker and Kubernetes
+  hosts: all
+  become: true
+  vars:
+    kubernetes_version: "1.32"
+    docker_users: ["userA"] # project username chosen
+    src_directory: "webserver"
+    app_directory: "/opt/nginx-k8s"
+    docker_image_name: "nginx-custom"
+    docker_image_tag: "latest"
+
+  tasks:
+    # Update and install required packages
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required system packages
+      apt:
+        name: "{{ packages }}"
+        state: present
+      vars:
+        packages:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+          - gnupg
+          - lsb-release
+          - python3.11
+          - python3-pip
+
+    # Install Docker
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Install Docker
+      apt:
+        name: "{{ packages }}"
+        state: present
+        update_cache: yes
+      vars:
+        packages:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+
+    - name: Ensure Docker service is started and enabled
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add users to docker group
+      user:
+        name: "{{ item }}"
+        groups: docker
+        append: yes
+      loop: "{{ docker_users }}"
+
+    # Configure containerd for Kubernetes
+    - name: Create containerd configuration directory
+      file:
+        path: /etc/containerd
+        state: directory
+
+    - name: Configure containerd
+      copy:
+        content: |
+          version = 2
+          [plugins."io.containerd.grpc.v1.cri"]
+            systemd_cgroup = true
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+            runtime_type = "io.containerd.runc.v2"
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+            SystemdCgroup = true
+        dest: /etc/containerd/config.toml
+
+    - name: Restart containerd
+      service:
+        name: containerd
+        state: restarted
+
+    # Downloads the gpg key and add kubernetes repo
+    - name: Get key and add Kubernetes repo
+      block:
+      - name: Add Kubernetes GPG key
+        get_url:
+          url: https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key
+          dest: "/etc/apt/keyrings/kubernetes-apt-keyring.asc"
+
+      - name: Add Kubernetes repository
+        apt_repository:
+          repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /"
+          state: present
+
+    - name: Install kubernetes pre-requisites packages
+      pip:
+        name:
+          - openshift
+          - pyyaml
+          - kubernetes
+
+    - name: Install Kubernetes packages
+      apt:
+        name: "{{ packages }}"
+        state: present
+      vars:
+        packages:
+          - kubelet
+          - kubeadm
+          - kubectl
+
+    - name: Hold Kubernetes packages at their installed version
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    # Configure system for Kubernetes
+    - name: Disable swap
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Remove swap entry from /etc/fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+        replace: '# \1'
+
+    - name: Enable kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - br_netfilter
+        - overlay
+
+    - name: Configure sysctl parameters
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+      loop:
+        - { name: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { name: 'net.ipv4.ip_forward', value: '1' }
+
+    - name: Ensure br_netfilter module is loaded on boot
+      copy:
+        content: "br_netfilter"
+        dest: /etc/modules-load.d/br_netfilter.conf
+
+    - name: Download Minikube binary
+      get_url:
+        url: https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+        dest: /usr/local/bin/minikube
+        mode: '0755'
+
+    - name: Create application directory
+      file:
+        path: "{{ app_directory }}"
+        state: directory
+        mode: '0755'
+
+    - name: Copy Dockerfile
+      copy:
+        src: "{{ src_directory }}/Dockerfile"
+        dest: "{{ app_directory }}/Dockerfile"
+
+    - name: Copy index.html
+      copy:
+        src: "{{ src_directory }}/index.html"
+        dest: "{{ app_directory }}/index.html"
+
+    - name: Copy Kubernetes deployment manifest
+      copy:
+        src: "{{ src_directory }}/deployment.yaml"
+        dest: "{{ app_directory }}/deployment.yaml"
+
+    - name: Copy Kubernetes service manifest
+      copy:
+        src: "{{ src_directory }}/service.yaml"
+        dest: "{{ app_directory }}/service.yaml"
+
+    - name: Build Docker image
+      docker_image:
+        build:
+          path: "{{ app_directory }}"
+        name: "{{ docker_image_name }}"
+        tag: "{{ docker_image_tag }}"
+        source: build
+        force_source: yes
+
